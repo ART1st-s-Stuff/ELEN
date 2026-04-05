@@ -1,0 +1,3 @@
+[submodule "lewm"]
+	path = lewm
+	url = git@github.com:ART1st-s-Stuff/le-wm.git
