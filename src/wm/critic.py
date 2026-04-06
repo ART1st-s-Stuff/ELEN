@@ -1,74 +1,93 @@
-"""LEWM 状态序列打分：复用 ARPredictor 骨干，对每个时间步输出 (0, 1) 标量。"""
+"""基于 LEWM 的 ARPredictor 的状态价值头：对序列上每个时间步输出 [0,1] 标量分数。"""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-
 import torch
 from torch import nn
 
-_elen_root = Path(__file__).resolve().parents[2]
-_lewm_dir = _elen_root / "lewm"
-if _lewm_dir.is_dir():
-    _p = str(_lewm_dir)
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+# 以 ELEN 为根目录时可导入 lewm.module
+_ELEN_ROOT = Path(__file__).resolve().parents[2]
+if str(_ELEN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ELEN_ROOT))
 
-from module import ARPredictor  # noqa: E402
+from lewm.module import ARPredictor
 
 
-def _predictor_input_dim(predictor: ARPredictor) -> int:
-    return int(predictor.pos_embedding.shape[-1])
-
-
-def _predictor_token_output_dim(predictor: ARPredictor) -> int:
-    t = predictor.transformer
-    op = t.output_proj
-    if isinstance(op, nn.Linear):
-        return int(op.out_features)
-    return int(t.norm.normalized_shape[0])
+def _arpredictor_out_features(predictor: ARPredictor) -> int:
+    """ARPredictor 前向输出最后一维大小。"""
+    out = predictor.transformer.output_proj
+    if isinstance(out, nn.Linear):
+        return out.out_features
+    # Identity：各层工作在 hidden_dim
+    return predictor.transformer.layers[0].attn.norm.normalized_shape[0]
 
 
 class Critic(nn.Module):
-    """仅使用 LEWM 状态序列 `emb`（与 JEPA 中 predictor 输入同形状），逐步打分。"""
+    """
+    输入为 LEWM 的 state 嵌入 ``emb``，形状 ``(B, T, D)``，与训练时 predictor 的 ``x`` 一致。
+    ARPredictor 需要条件 ``c``：此处用与 ``D`` 维一致的全零张量占位（与 ``act_emb`` 同形状）。
+    输出 ``(B, T)``，每个时间步一个分数，值域 (0,1)。
+    """
 
     def __init__(self, predictor: ARPredictor):
         super().__init__()
         self.predictor = predictor
-        d_in = _predictor_input_dim(predictor)
-        self._null_cond = nn.Parameter(torch.zeros(1, 1, d_in))
-        d_out = _predictor_token_output_dim(predictor)
-        self.score_head = nn.Linear(d_out, 1)
+        d_out = _arpredictor_out_features(predictor)
+        self.value_head = nn.Linear(d_out, 1)
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         """
-        state: (B, T, D)，与 LEWM `emb` / ARPredictor 的 x 一致，D == predictor input_dim。
-        返回: (B, T)，每步一个 [0, 1] 标量。
+        Args:
+            state: (B, T, D)，LEWM 的 state / emb。
+
+        Returns:
+            scores: (B, T)，sigmoid 后的标量分数。
         """
-        b, t, _ = state.shape
-        c = self._null_cond.expand(b, t, -1).to(dtype=state.dtype, device=state.device)
-        h = self.predictor(state, c)
-        return torch.sigmoid(self.score_head(h)).squeeze(-1)
+        if state.dim() != 3:
+            raise ValueError(f"state 期望 (B, T, D)，得到 {tuple(state.shape)}")
+        b, t, d = state.shape
+        act_emb = state.new_zeros(b, t, d)
+        h = self.predictor(state, act_emb)
+        return torch.sigmoid(self.value_head(h).squeeze(-1))
 
 
 class CriticWithEmbedding(nn.Module):
-    """LEWM 状态 + 外部来源的逐帧 embedding，经线性对齐为 ARPredictor 的条件 c。"""
+    """
+    输入为 LEWM 的 state ``(B, T, D)`` 以及其它来源的 embedding ``(B, T, E)``。
+    将二者拼接后经线性层映射到 ARPredictor 的 ``input_dim``，条件 ``c`` 由外部 embedding 单独线性映射到同维度。
+    输出 ``(B, T)``，每步一个 [0,1] 分数。
+    """
 
-    def __init__(self, predictor: ARPredictor, extra_emb_dim: int):
+    def __init__(
+        self,
+        predictor: ARPredictor,
+        state_dim: int,
+        ext_emb_dim: int,
+    ):
         super().__init__()
         self.predictor = predictor
-        d_in = _predictor_input_dim(predictor)
-        self.ext_to_cond = nn.Linear(extra_emb_dim, d_in)
-        d_out = _predictor_token_output_dim(predictor)
-        self.score_head = nn.Linear(d_out, 1)
+        input_dim = predictor.pos_embedding.shape[-1]
+        self.merge = nn.Linear(state_dim + ext_emb_dim, input_dim)
+        self.cond_from_ext = nn.Linear(ext_emb_dim, input_dim)
+        d_out = _arpredictor_out_features(predictor)
+        self.value_head = nn.Linear(d_out, 1)
 
-    def forward(self, state: torch.Tensor, extra_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, state: torch.Tensor, ext_emb: torch.Tensor) -> torch.Tensor:
         """
-        state: (B, T, D_state)，LEWM 状态，D_state == predictor input_dim。
-        extra_emb: (B, T, D_extra)，外部 embedding，D_extra == 构造时的 extra_emb_dim。
-        返回: (B, T)，每步一个 [0, 1] 标量。
+        Args:
+            state: (B, T, state_dim)
+            ext_emb: (B, T, ext_emb_dim)
+
+        Returns:
+            scores: (B, T)
         """
-        c = self.ext_to_cond(extra_emb)
-        h = self.predictor(state, c)
-        return torch.sigmoid(self.score_head(h)).squeeze(-1)
+        if state.dim() != 3 or ext_emb.dim() != 3:
+            raise ValueError("state 与 ext_emb 均应为 (B, T, *)")
+        if state.shape[:2] != ext_emb.shape[:2]:
+            raise ValueError("state 与 ext_emb 的 B、T 必须一致")
+        x = self.merge(torch.cat([state, ext_emb], dim=-1))
+        c = self.cond_from_ext(ext_emb)
+        h = self.predictor(x, c)
+        return torch.sigmoid(self.value_head(h).squeeze(-1))
