@@ -14,7 +14,7 @@ import h5py
 import numpy as np
 import torch
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler, random_split
 from tqdm import tqdm
 
 _LOGGER = logging.getLogger(__name__)
@@ -380,6 +380,38 @@ def _compute_pos_weight_for_indices(h5_path: Path, indices: list[int] | range) -
     return float(n_neg / n_pos)
 
 
+def _build_resample_weights(
+    h5_path: Path, indices: list[int] | range, neg_pos_ratio: float
+) -> torch.Tensor | None:
+    """
+    构造 ``WeightedRandomSampler`` 的逐样本权重，使每个 epoch 内抽样的
+    **期望次数比** 负:正 ≈ ``neg_pos_ratio`` : 1。
+
+    取 ``w_pos = 1``、``w_neg = neg_pos_ratio * n_pos / n_neg``（总权重比为
+    ``n_neg * w_neg : n_pos * w_pos = neg_pos_ratio : 1``）。
+
+    若训练划分中无正样本或无负样本，返回 ``None``（调用方应退化为均匀采样）。
+    """
+    if neg_pos_ratio <= 0:
+        return None
+    n_pos = 0
+    flags: list[bool] = []
+    with h5py.File(h5_path, "r") as f:
+        ie = f["is_end"]
+        for i in indices:
+            pos = float(ie[i]) >= 0.5
+            flags.append(pos)
+            if pos:
+                n_pos += 1
+    n = len(indices)
+    n_neg = n - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return None
+    w_neg = float(neg_pos_ratio) * float(n_pos) / float(n_neg)
+    w_list = [1.0 if p else w_neg for p in flags]
+    return torch.tensor(w_list, dtype=torch.double)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train NavigationTerminalScorer (phase 2).")
     p.add_argument("--h5-path", type=Path, required=True, help="HDF5 with pixels, instruction, is_end")
@@ -417,7 +449,17 @@ def parse_args() -> argparse.Namespace:
         "--pos-weight",
         type=float,
         default=None,
-        help="BCE positive class weight; default: auto from training split (neg/pos).",
+        help="BCE positive class weight；指定时覆盖自动计算。",
+    )
+    p.add_argument(
+        "--train-neg-pos-ratio",
+        type=float,
+        default=3.0,
+        help=(
+            "训练集加权采样目标 负:正（例如 3 表示 3:1）。"
+            ">0 时启用 WeightedRandomSampler；0 表示均匀打乱、不重采样。"
+            "未指定 --pos-weight 时，启用重采样则 BCE pos_weight 取该比值（与抽样目标一致）。"
+        ),
     )
     p.add_argument("--hidden-dim", type=int, default=512)
     p.add_argument("--mlp-layers", type=int, default=2)
@@ -495,13 +537,49 @@ def main() -> None:
         generator=torch.Generator().manual_seed(args.seed),
     )
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-    )
+    tr_idx = list(train_ds.indices)  # type: ignore[attr-defined]
+    use_resample = args.train_neg_pos_ratio > 0
+    resample_weights: torch.Tensor | None = None
+    if use_resample:
+        resample_weights = _build_resample_weights(
+            full._path, tr_idx, args.train_neg_pos_ratio
+        )
+        if resample_weights is None:
+            _LOGGER.warning(
+                "训练划分中缺少正样本或负样本，无法按负:正=%.4f:1 重采样，改用均匀打乱。",
+                args.train_neg_pos_ratio,
+            )
+            use_resample = False
+
+    if use_resample:
+        _LOGGER.info(
+            "训练集 WeightedRandomSampler：目标负:正=%.4f:1，每 epoch 抽样数=%d（有放回）",
+            args.train_neg_pos_ratio,
+            len(train_ds),
+        )
+        sampler_gen = torch.Generator().manual_seed(args.seed)
+        train_sampler = WeightedRandomSampler(
+            resample_weights,  # type: ignore[arg-type]
+            num_samples=len(train_ds),
+            replacement=True,
+            generator=sampler_gen,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
+
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
@@ -512,10 +590,16 @@ def main() -> None:
 
     if args.pos_weight is not None:
         pw = torch.tensor([args.pos_weight], device=device)
+        _LOGGER.info("BCE pos_weight (manual)=%.4f", float(pw.item()))
+    elif use_resample:
+        pw = torch.tensor([args.train_neg_pos_ratio], device=device)
+        _LOGGER.info(
+            "BCE pos_weight (与重采样目标负:正一致)=%.4f",
+            float(pw.item()),
+        )
     else:
-        tr_idx = list(train_ds.indices)  # type: ignore[attr-defined]
         ratio = _compute_pos_weight_for_indices(full._path, tr_idx)
-        _LOGGER.info("BCE pos_weight (auto neg/pos on train split)=%.4f", ratio)
+        _LOGGER.info("BCE pos_weight (数据集 train 划分 neg/pos)=%.4f", ratio)
         pw = torch.tensor([ratio], device=device)
 
     opt = torch.optim.AdamW(scorer.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -533,6 +617,10 @@ def main() -> None:
         "img_size": img_size,
         "embed_dim": embed_dim,
         "text_dim": text_embedder.text_dim,
+        "train_neg_pos_ratio": args.train_neg_pos_ratio,
+        "train_resample_enabled": use_resample,
+        "bce_pos_weight": float(pw.item()),
+        "bce_pos_weight_manual": args.pos_weight is not None,
     }
     (args.output_dir / "train_navigation_scorer_meta.json").write_text(
         json.dumps(meta, indent=2), encoding="utf-8"
@@ -569,6 +657,8 @@ def main() -> None:
                 "mlp_layers": args.mlp_layers,
                 "dropout": args.dropout,
                 "train_split": args.train_split,
+                "train_neg_pos_ratio": args.train_neg_pos_ratio,
+                "train_resample": use_resample,
                 "pos_weight": float(pw.item()),
                 "output_dir": str(args.output_dir),
             },
