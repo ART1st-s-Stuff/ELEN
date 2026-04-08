@@ -3,7 +3,7 @@
 # 在验证划分上评估已训练的 navigation_scorer（需与 train 相同的 HDF5、JEPA ckpt、随机种子）。
 # 环境变量（与 train_navigation_scorer.sh 对齐）：
 #   LEWM_JEPA_CKPT   — LeWM *_object.ckpt（可自动探测）
-#   NAV_H5_PATH      — 默认 ELEN/datasets/navigation/eb_nav_train.h5
+#   NAV_H5_PATH      — 默认 ELEN/datasets/navigation/eb_nav_test.h5
 #   SCORER_CKPT      — 默认 ELEN/models/navigation_scorer/navigation_scorer_best.pt
 #   SCORER_OUT_DIR   — 若未设置 SCORER_CKPT，则在此目录下找 navigation_scorer_best.pt
 #   QWEN_EMBED_MODEL — 与训练时一致
@@ -14,7 +14,7 @@ ELEN_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 LEWM_DIR="${LEWM_DIR:-${ELEN_DIR}/lewm}"
 MODEL_SUBDIR="${LEWM_MODEL_SUBDIR:-models/lewm/navigation}"
 DATASET_NAV="${NAV_DATASET_DIR:-${ELEN_DIR}/datasets/navigation}"
-H5_NAME="${NAV_OUT_H5:-eb_nav_train.h5}"
+H5_NAME="${NAV_OUT_H5:-eb_nav_test.h5}"
 
 export STABLEWM_HOME="${STABLEWM_HOME:-${ELEN_DIR}}"
 export PYTHONPATH="${ELEN_DIR}:${LEWM_DIR}:${PYTHONPATH:-}"

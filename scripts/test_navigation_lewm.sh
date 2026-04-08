@@ -10,7 +10,7 @@ ELEN_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 LEWM_DIR="${LEWM_DIR:-${ELEN_DIR}/lewm}"
 MODEL_SUBDIR="${LEWM_MODEL_SUBDIR:-models/lewm/navigation}"
 DATASET_NAV="${NAV_DATASET_DIR:-${ELEN_DIR}/datasets/navigation}"
-H5_NAME="${NAV_OUT_H5:-eb_nav_train.h5}"
+H5_NAME="${NAV_OUT_H5:-eb_nav_test.h5}"
 H5_PATH="${DATASET_NAV}/${H5_NAME}"
 
 export STABLEWM_HOME="${STABLEWM_HOME:-${ELEN_DIR}}"

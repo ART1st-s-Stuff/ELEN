@@ -34,6 +34,22 @@ from lewm.utils import get_img_preprocessor  # noqa: E402
 from src.wm.critic import NavigationTerminalScorer  # noqa: E402
 
 
+def _str2bool(v: str) -> bool:
+    s = str(v).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"非法布尔值: {v}")
+
+
+def _none_if_empty(v: str | None) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
 def _set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -269,6 +285,34 @@ def train_one_epoch(
     return total / max(n, 1)
 
 
+def _binary_auroc(labels: torch.Tensor, scores: torch.Tensor) -> float:
+    labels = labels.to(dtype=torch.float32).flatten().cpu()
+    scores = scores.to(dtype=torch.float32).flatten().cpu()
+    n = int(labels.numel())
+    if n == 0:
+        return 0.0
+    n_pos = int((labels >= 0.5).sum().item())
+    n_neg = n - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+
+    order = torch.argsort(scores)
+    sorted_scores = scores[order]
+    sorted_labels = labels[order]
+    ranks = torch.zeros(n, dtype=torch.float32)
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and sorted_scores[j] == sorted_scores[i]:
+            j += 1
+        avg_rank = (i + 1 + j) / 2.0
+        ranks[i:j] = avg_rank
+        i = j
+    sum_pos_ranks = float(ranks[sorted_labels >= 0.5].sum().item())
+    auc = (sum_pos_ranks - n_pos * (n_pos + 1) / 2.0) / float(n_pos * n_neg)
+    return float(auc)
+
+
 @torch.no_grad()
 def evaluate(
     jepa,
@@ -278,11 +322,13 @@ def evaluate(
     pixel_transform,
     device: torch.device,
     pos_weight: torch.Tensor | None,
-) -> tuple[float, float]:
+) -> dict[str, float]:
     scorer.eval()
     loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     total_loss, n = 0.0, 0
-    correct = 0
+    tp = fp = tn = fn = 0
+    all_scores: list[torch.Tensor] = []
+    all_labels: list[torch.Tensor] = []
     use_amp = device.type == "cuda"
     for batch in tqdm(loader, desc="val", leave=False):
         pixels_b1chw, texts, y = _collate_scorer_batch(batch, pixel_transform, device)
@@ -298,9 +344,26 @@ def evaluate(
         total_loss += float(loss) * y.size(0)
         n += y.size(0)
         pred = (torch.sigmoid(logits) >= 0.5).float()
-        correct += int((pred == y).sum().item())
-    acc = correct / max(n, 1)
-    return total_loss / max(n, 1), acc
+        all_scores.append(torch.sigmoid(logits).detach().cpu())
+        all_labels.append(y.detach().cpu())
+        tp += int(((pred == 1) & (y == 1)).sum().item())
+        fp += int(((pred == 1) & (y == 0)).sum().item())
+        tn += int(((pred == 0) & (y == 0)).sum().item())
+        fn += int(((pred == 0) & (y == 1)).sum().item())
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
+    acc = (tp + tn) / max(n, 1)
+    val_loss = total_loss / max(n, 1)
+    auroc = _binary_auroc(torch.cat(all_labels), torch.cat(all_scores))
+    return {
+        "val_loss": val_loss,
+        "accuracy": acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "auroc": auroc,
+    }
 
 
 def _compute_pos_weight_for_indices(h5_path: Path, indices: list[int] | range) -> float:
@@ -360,6 +423,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mlp-layers", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--train-split", type=float, default=0.9)
+    p.add_argument(
+        "--wandb-enabled",
+        type=_str2bool,
+        default=_str2bool(os.environ.get("SCORER_WANDB_ENABLED", "false")),
+        help="是否启用 Weights & Biases（默认 false，可由环境变量 SCORER_WANDB_ENABLED 覆盖）。",
+    )
+    p.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=os.environ.get("SCORER_WANDB_ENTITY"),
+        help="W&B entity（可选）。",
+    )
+    p.add_argument(
+        "--wandb-project",
+        type=str,
+        default=os.environ.get("SCORER_WANDB_PROJECT", "navigation_scorer"),
+        help="W&B project 名称。",
+    )
+    p.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=os.environ.get("SCORER_WANDB_RUN_NAME"),
+        help="W&B run 名称（可选）。",
+    )
+    p.add_argument(
+        "--wandb-run-id",
+        type=str,
+        default=os.environ.get("SCORER_WANDB_RUN_ID"),
+        help="W&B run id（可选，断点续训可用）。",
+    )
     return p.parse_args()
 
 
@@ -445,6 +538,43 @@ def main() -> None:
         json.dumps(meta, indent=2), encoding="utf-8"
     )
 
+    run = None
+    if args.wandb_enabled:
+        wandb_entity = _none_if_empty(args.wandb_entity)
+        wandb_run_name = _none_if_empty(args.wandb_run_name)
+        wandb_run_id = _none_if_empty(args.wandb_run_id)
+        try:
+            import wandb
+        except Exception as e:
+            raise RuntimeError("已启用 wandb，但导入失败。请先安装 wandb 并完成 wandb login。") from e
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=wandb_entity,
+            name=wandb_run_name,
+            id=wandb_run_id,
+            resume="allow" if wandb_run_id else None,
+            config={
+                "h5_path": str(args.h5_path),
+                "jepa_ckpt": str(args.jepa_ckpt),
+                "qwen_model": args.qwen_model,
+                "img_size": img_size,
+                "embed_dim": embed_dim,
+                "text_dim": text_embedder.text_dim,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+                "seed": args.seed,
+                "hidden_dim": args.hidden_dim,
+                "mlp_layers": args.mlp_layers,
+                "dropout": args.dropout,
+                "train_split": args.train_split,
+                "pos_weight": float(pw.item()),
+                "output_dir": str(args.output_dir),
+            },
+        )
+        _LOGGER.info("W&B enabled: project=%s run=%s", args.wandb_project, run.name)
+
     for epoch in range(1, args.epochs + 1):
         tr_loss = train_one_epoch(
             jepa,
@@ -457,7 +587,7 @@ def main() -> None:
             scaler,
             pw,
         )
-        va_loss, va_acc = evaluate(
+        val_metrics = evaluate(
             jepa,
             text_embedder,
             scorer,
@@ -467,34 +597,69 @@ def main() -> None:
             pw,
         )
         _LOGGER.info(
-            "epoch %d | train_loss=%.4f | val_loss=%.4f | val_acc=%.4f",
+            (
+                "epoch %d | train_loss=%.4f | val_loss=%.4f | "
+                "accuracy=%.4f | precision=%.4f | recall=%.4f | f1=%.4f | auroc=%.4f"
+            ),
             epoch,
             tr_loss,
-            va_loss,
-            va_acc,
+            val_metrics["val_loss"],
+            val_metrics["accuracy"],
+            val_metrics["precision"],
+            val_metrics["recall"],
+            val_metrics["f1"],
+            val_metrics["auroc"],
         )
+        if run is not None:
+            run.log(
+                {
+                    "epoch": epoch,
+                    "train/loss": tr_loss,
+                    "val/loss": val_metrics["val_loss"],
+                    "val/accuracy": val_metrics["accuracy"],
+                    "val/precision": val_metrics["precision"],
+                    "val/recall": val_metrics["recall"],
+                    "val/f1": val_metrics["f1"],
+                    "val/auroc": val_metrics["auroc"],
+                },
+                step=epoch,
+            )
         torch.save(
             {
                 "scorer": scorer.state_dict(),
                 "epoch": epoch,
-                "val_loss": va_loss,
-                "val_acc": va_acc,
+                "val_loss": val_metrics["val_loss"],
+                "val_acc": val_metrics["accuracy"],
+                "val_accuracy": val_metrics["accuracy"],
+                "val_precision": val_metrics["precision"],
+                "val_recall": val_metrics["recall"],
+                "val_f1": val_metrics["f1"],
+                "val_auroc": val_metrics["auroc"],
                 "meta": meta,
             },
             args.output_dir / "navigation_scorer_last.pt",
         )
-        if va_loss < best_val:
-            best_val = va_loss
+        if val_metrics["val_loss"] < best_val:
+            best_val = val_metrics["val_loss"]
             torch.save(
                 {
                     "scorer": scorer.state_dict(),
                     "epoch": epoch,
-                    "val_loss": va_loss,
-                    "val_acc": va_acc,
+                    "val_loss": val_metrics["val_loss"],
+                    "val_acc": val_metrics["accuracy"],
+                    "val_accuracy": val_metrics["accuracy"],
+                    "val_precision": val_metrics["precision"],
+                    "val_recall": val_metrics["recall"],
+                    "val_f1": val_metrics["f1"],
+                    "val_auroc": val_metrics["auroc"],
                     "meta": meta,
                 },
                 args.output_dir / "navigation_scorer_best.pt",
             )
+
+    if run is not None:
+        run.summary["best_val_loss"] = best_val
+        run.finish()
 
     full.close()
     _LOGGER.info("Done. Checkpoints under %s", args.output_dir)

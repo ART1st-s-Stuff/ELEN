@@ -6,6 +6,8 @@
 #   NAV_H5_PATH     — 默认 ELEN/datasets/navigation/eb_nav_train.h5
 #   SCORER_OUT_DIR  — 默认 ELEN/models/navigation_scorer
 #   QWEN_EMBED_MODEL — 默认 Qwen/Qwen3-Embedding-0.6B（可与 Qwen3.5 系 embedding 模型互换）
+#   SCORER_WANDB_ENABLED/SCORER_WANDB_ENTITY/SCORER_WANDB_PROJECT/
+#   SCORER_WANDB_RUN_NAME/SCORER_WANDB_RUN_ID — 阶段2 wandb 配置（可选）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,11 +48,16 @@ echo "[train_navigation_scorer] JEPA_CKPT=${JEPA_CKPT}"
 echo "[train_navigation_scorer] OUT_DIR=${OUT_DIR}"
 
 cd "${ELEN_DIR}"
-DEFAULT_SCORER_EPOCHS="${SCORER_EPOCHS:-4}"
+DEFAULT_SCORER_EPOCHS="${SCORER_EPOCHS:-20}"
 
 exec python -m src.dev.train_navigation_scorer \
   --h5-path "${H5_PATH}" \
   --jepa-ckpt "${JEPA_CKPT}" \
   --epochs "${DEFAULT_SCORER_EPOCHS}" \
   --output-dir "${OUT_DIR}" \
+  --wandb-enabled "${SCORER_WANDB_ENABLED:-false}" \
+  --wandb-entity "${SCORER_WANDB_ENTITY:-}" \
+  --wandb-project "${SCORER_WANDB_PROJECT:-navigation_scorer}" \
+  --wandb-run-name "${SCORER_WANDB_RUN_NAME:-}" \
+  --wandb-run-id "${SCORER_WANDB_RUN_ID:-}" \
   ${SCORER_EXTRA_ARGS:-} "$@"

@@ -28,10 +28,93 @@ from src.dev.train_navigation_scorer import (  # noqa: E402
     _compute_pos_weight_for_indices,
     _infer_embed_dim,
     _load_jepa,
-    evaluate,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _binary_auroc(labels: torch.Tensor, scores: torch.Tensor) -> float:
+    labels = labels.to(dtype=torch.float32).flatten().cpu()
+    scores = scores.to(dtype=torch.float32).flatten().cpu()
+    n = int(labels.numel())
+    if n == 0:
+        return 0.0
+    n_pos = int((labels >= 0.5).sum().item())
+    n_neg = n - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+
+    order = torch.argsort(scores)
+    sorted_scores = scores[order]
+    sorted_labels = labels[order]
+    ranks = torch.zeros(n, dtype=torch.float32)
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and sorted_scores[j] == sorted_scores[i]:
+            j += 1
+        avg_rank = (i + 1 + j) / 2.0
+        ranks[i:j] = avg_rank
+        i = j
+    sum_pos_ranks = float(ranks[sorted_labels >= 0.5].sum().item())
+    auc = (sum_pos_ranks - n_pos * (n_pos + 1) / 2.0) / float(n_pos * n_neg)
+    return float(auc)
+
+
+@torch.no_grad()
+def evaluate_with_metrics(
+    jepa,
+    text_embedder: _QwenTextEmbedder,
+    scorer: NavigationTerminalScorer,
+    loader: DataLoader,
+    pixel_transform,
+    device: torch.device,
+    pos_weight: torch.Tensor | None,
+) -> dict[str, float]:
+    scorer.eval()
+    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    total_loss, n = 0.0, 0
+    tp = fp = tn = fn = 0
+    all_scores: list[torch.Tensor] = []
+    all_labels: list[torch.Tensor] = []
+    use_amp = device.type == "cuda"
+
+    for batch in loader:
+        pixels_b1chw, texts, y = _collate_scorer_batch(batch, pixel_transform, device)
+        if use_amp:
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                enc = jepa.encode({"pixels": pixels_b1chw})
+        else:
+            enc = jepa.encode({"pixels": pixels_b1chw})
+        latent = enc["emb"][:, 0, :].float()
+        t_emb = text_embedder(texts).float()
+        logits = scorer(latent, t_emb)
+        loss = loss_fn(logits.float(), y)
+        total_loss += float(loss) * y.size(0)
+        n += y.size(0)
+
+        pred = (torch.sigmoid(logits) >= 0.5).float()
+        all_scores.append(torch.sigmoid(logits).detach().cpu())
+        all_labels.append(y.detach().cpu())
+        tp += int(((pred == 1) & (y == 1)).sum().item())
+        fp += int(((pred == 1) & (y == 0)).sum().item())
+        tn += int(((pred == 0) & (y == 0)).sum().item())
+        fn += int(((pred == 0) & (y == 1)).sum().item())
+
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
+    acc = (tp + tn) / max(n, 1)
+    val_loss = total_loss / max(n, 1)
+    auroc = _binary_auroc(torch.cat(all_labels), torch.cat(all_scores))
+    return {
+        "val_loss": val_loss,
+        "accuracy": acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "auroc": auroc,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,7 +211,7 @@ def main() -> None:
         _LOGGER.info("BCE pos_weight (auto)=%.4f", ratio)
         pw = torch.tensor([ratio], device=device)
 
-    val_loss, val_acc = evaluate(
+    metrics = evaluate_with_metrics(
         jepa,
         text_embedder,
         scorer,
@@ -137,8 +220,25 @@ def main() -> None:
         device,
         pw,
     )
-    _LOGGER.info("val_loss=%.6f val_acc=%.6f", val_loss, val_acc)
-    print(f"val_loss={val_loss:.6f} val_acc={val_acc:.6f}")
+    _LOGGER.info(
+        "val_loss=%.6f accuracy=%.6f precision=%.6f recall=%.6f f1=%.6f auroc=%.6f",
+        metrics["val_loss"],
+        metrics["accuracy"],
+        metrics["precision"],
+        metrics["recall"],
+        metrics["f1"],
+        metrics["auroc"],
+    )
+    print(
+        "val_loss={:.6f} accuracy={:.6f} precision={:.6f} recall={:.6f} f1={:.6f} auroc={:.6f}".format(
+            metrics["val_loss"],
+            metrics["accuracy"],
+            metrics["precision"],
+            metrics["recall"],
+            metrics["f1"],
+            metrics["auroc"],
+        )
+    )
 
     full.close()
 
