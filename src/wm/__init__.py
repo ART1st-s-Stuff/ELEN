@@ -1,3 +1,3 @@
-from .critic import Critic, CriticWithEmbedding
+from .critic import NavigationTerminalScorer
 
-__all__ = ["Critic", "CriticWithEmbedding"]
+__all__ = ["NavigationTerminalScorer"]
