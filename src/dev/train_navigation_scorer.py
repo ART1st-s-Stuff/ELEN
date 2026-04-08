@@ -31,7 +31,7 @@ import stable_pretraining as spt  # noqa: E402
 
 from lewm.utils import get_img_preprocessor  # noqa: E402
 
-from .critic import NavigationTerminalScorer  # noqa: E402
+from src.wm.critic import NavigationTerminalScorer  # noqa: E402
 
 
 def _set_seed(seed: int) -> None:

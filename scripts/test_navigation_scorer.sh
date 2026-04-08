@@ -58,7 +58,7 @@ echo "[test_navigation_scorer] JEPA_CKPT=${JEPA_CKPT}"
 echo "[test_navigation_scorer] SCORER_CKPT=${SCORER_CKPT}"
 
 cd "${ELEN_DIR}"
-exec python -m src.wm.test_navigation_scorer \
+exec python -m src.dev.test_navigation_scorer \
   --h5-path "${H5_PATH}" \
   --jepa-ckpt "${JEPA_CKPT}" \
   --scorer-ckpt "${SCORER_CKPT}" \

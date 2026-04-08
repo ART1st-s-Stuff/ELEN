@@ -48,7 +48,7 @@ echo "[train_navigation_scorer] OUT_DIR=${OUT_DIR}"
 cd "${ELEN_DIR}"
 DEFAULT_SCORER_EPOCHS="${SCORER_EPOCHS:-4}"
 
-exec python -m src.wm.train_navigation_scorer \
+exec python -m src.dev.train_navigation_scorer \
   --h5-path "${H5_PATH}" \
   --jepa-ckpt "${JEPA_CKPT}" \
   --epochs "${DEFAULT_SCORER_EPOCHS}" \

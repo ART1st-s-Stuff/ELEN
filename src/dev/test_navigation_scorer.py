@@ -19,7 +19,7 @@ for _p in (_ELEN_ROOT, _LEWM_ROOT):
     if _s not in sys.path:
         sys.path.insert(0, _s)
 
-from src.wm.train_navigation_scorer import (  # noqa: E402
+from src.dev.train_navigation_scorer import (  # noqa: E402
     NavigationTerminalScorer,
     _H5RowDataset,
     _QwenTextEmbedder,
