@@ -1,50 +1,35 @@
-"""Navigation terminal scorer with LeWM-style AdaLN-Zero conditioning."""
+"""Navigation terminal scorer：复用 LeWM ``ARPredictor``，条件向量由 prompt 嵌入代替原 action 嵌入，输出二分类 logits。"""
 
 from __future__ import annotations
+
+import sys
+from pathlib import Path
 
 import torch
 from torch import nn
 
-from lewm.module import modulate
+# 与 train_navigation_scorer 等脚本一致：保证可导入 lewm
+_ELEN_ROOT = Path(__file__).resolve().parents[2]
+_LEWM_ROOT = _ELEN_ROOT / "lewm"
+for _p in (_ELEN_ROOT, _LEWM_ROOT):
+    _s = str(_p)
+    if _s not in sys.path:
+        sys.path.insert(0, _s)
 
-
-class _AdaLNZeroMLPBlock(nn.Module):
-    """LeWM-style AdaLN-Zero block for conditioning latent with text embedding."""
-
-    def __init__(self, latent_dim: int, text_dim: int, dropout: float) -> None:
-        super().__init__()
-        self.norm = nn.LayerNorm(latent_dim, elementwise_affine=False, eps=1e-6)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(text_dim, 3 * latent_dim, bias=True),
-        )
-        self.ff = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(latent_dim, latent_dim),
-            nn.Dropout(dropout),
-        )
-        # AdaLN-Zero: zero-init keeps initial behavior close to identity.
-        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
-
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        shift, scale, gate = self.adaLN_modulation(c).chunk(3, dim=-1)
-        h = self.ff(modulate(self.norm(x), shift, scale))
-        return x + gate * h
+from lewm.module import ARPredictor  # noqa: E402
 
 
 class NavigationTerminalScorer(nn.Module):
     """
-    Binary classifier for "terminal / end state" from AdaLN-Zero conditioned features.
+    使用与 LeWM 相同的 ``ARPredictor``（AdaLN-Zero + Transformer），
+    其中原 predictor 的 ``c``（动作嵌入）替换为 **prompt 嵌入**（经线性层映射到与 latent 相同的 ``input_dim``）。
 
     Args:
-        latent: ``(B, D)`` — per-frame embedding from ``JEPA.encode`` → ``emb`` (e.g. ``emb[:, t]``).
-        text_emb: ``(B, E)`` — frozen text encoder output (e.g. Qwen embedding).
+        latent: ``(B, D)`` — 单帧嵌入，例如 ``JEPA.encode`` 的 ``emb[:, t]``。
+        text_emb: ``(B, E)`` — 冻结文本编码器输出的 prompt 嵌入（如 Qwen）。
 
     Returns:
-        Logits ``(B,)`` for ``BCEWithLogitsLoss`` (apply ``sigmoid`` for probabilities in ``[0, 1]``).
+        Logits ``(B,)``，用于 ``BCEWithLogitsLoss``；``sigmoid`` 后为 ``[0, 1]`` 概率（对应类别 1）。
     """
 
     def __init__(
@@ -55,15 +40,27 @@ class NavigationTerminalScorer(nn.Module):
         hidden_dim: int = 512,
         num_hidden: int = 2,
         dropout: float = 0.1,
+        heads: int = 16,
+        mlp_dim: int = 2048,
+        dim_head: int = 64,
+        emb_dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        self.latent_proj = (
-            nn.Linear(latent_dim, hidden_dim) if latent_dim != hidden_dim else nn.Identity()
+        self.latent_dim = latent_dim
+        self.num_frames = 1
+        self.prompt_proj = nn.Linear(text_dim, latent_dim, bias=True)
+        self.predictor = ARPredictor(
+            num_frames=self.num_frames,
+            depth=num_hidden,
+            heads=heads,
+            mlp_dim=mlp_dim,
+            input_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+            dim_head=dim_head,
+            dropout=dropout,
+            emb_dropout=emb_dropout,
         )
-        self.blocks = nn.ModuleList(
-            [_AdaLNZeroMLPBlock(hidden_dim, text_dim, dropout) for _ in range(num_hidden)]
-        )
-        self.final_norm = nn.LayerNorm(hidden_dim)
         self.head = nn.Linear(hidden_dim, 1)
 
     def forward(self, latent: torch.Tensor, text_emb: torch.Tensor) -> torch.Tensor:
@@ -73,8 +70,10 @@ class NavigationTerminalScorer(nn.Module):
             )
         if latent.shape[0] != text_emb.shape[0]:
             raise ValueError("batch 维不一致")
-        x = self.latent_proj(latent)
-        for block in self.blocks:
-            x = block(x, text_emb)
-        x = self.final_norm(x)
-        return self.head(x).squeeze(-1)
+        if latent.shape[-1] != self.latent_dim:
+            raise ValueError(f"latent 最后一维应为 {self.latent_dim}，得到 {latent.shape[-1]}")
+
+        x = latent.unsqueeze(1)
+        c = self.prompt_proj(text_emb).unsqueeze(1)
+        h = self.predictor(x, c)
+        return self.head(h[:, -1, :]).squeeze(-1)

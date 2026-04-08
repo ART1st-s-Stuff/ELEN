@@ -1,4 +1,5 @@
 __pycache__
 datasets
 models
-./tmp/
+tmp/
+wandb/
